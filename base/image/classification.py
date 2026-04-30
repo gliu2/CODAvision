@@ -427,7 +427,13 @@ class ImageClassifier:
         for ax in axs:
             ax.axis('off')
         plt.subplots_adjust(wspace=0, hspace=0)
-        plt.show(block=False)
+
+        # Save the preview instead of showing an interactive window so the
+        # pipeline is never blocked waiting for the user to close a figure.
+        preview_path = os.path.join(self.output_path, 'classification_preview.jpg')
+        fig.savefig(preview_path, bbox_inches='tight', dpi=100)
+        plt.close(fig)
+        logger.info(f'  Classification preview saved to: {preview_path}')
 
     def classify(self, color_overlay: bool = True, color_mask: bool = False, display: bool = True) -> str:
         """

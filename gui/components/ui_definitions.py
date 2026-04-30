@@ -187,6 +187,11 @@ class Ui_MainWindow:
         self.create_downsample_CB.setGeometry(QRect(625, 167, 15, 15))
         self.create_downsample_CB.setVisible(False)
 
+        self.export_settings_PB = QPushButton(self.tab)
+        self.export_settings_PB.setObjectName(u"export_settings_PB")
+        self.export_settings_PB.setEnabled(False)
+        self.gridLayout_3.addWidget(self.export_settings_PB, 0, 1, 1, 1)
+
         self.prerecorded_PB = QPushButton(self.tab)
         self.prerecorded_PB.setObjectName(u"prerecorded_PB")
         self.prerecorded_PB.setEnabled(True)
@@ -631,7 +636,8 @@ class Ui_MainWindow:
         self.testing_LE.setToolTip(QCoreApplication.translate("MainWindow", u"Path to testing annotations", None))
         # endif // QT_CONFIG(tooltip)
         self.testing_PB.setText(QCoreApplication.translate("MainWindow", u"Browse", None))
-        self.prerecorded_PB.setText(QCoreApplication.translate("MainWindow", u"Load prerecorded data", None))
+        self.export_settings_PB.setText(QCoreApplication.translate("MainWindow", u"Export Settings", None))
+        self.prerecorded_PB.setText(QCoreApplication.translate("MainWindow", u"Load Settings", None))
         self.classify_PB.setText(QCoreApplication.translate("MainWindow", u"Classify images", None))
         self.tabWidget.setTabText(self.tabWidget.indexOf(self.tab),
                                   QCoreApplication.translate("MainWindow", u"File Location", None))

@@ -946,8 +946,19 @@ class PyTorchSegmentationTrainer:
         # Load data
         annotations, image_list = self._load_model_data()
 
-        # Calculate class weights
-        class_weights = self.calculate_class_weights(annotations, image_list)
+        # Calculate class weights (auto or user-specified)
+        user_weights = self.metadata.get('user_class_weights', None)
+        num_classes = len(self.metadata.get('classNames', []))
+        if (
+            user_weights is not None
+            and len(user_weights) == num_classes
+            and all(w > 0 for w in user_weights)
+        ):
+            class_weights = np.array(user_weights, dtype=np.float32)
+            self.logger.logger.info(f"Using user-specified class weights: {class_weights}")
+        else:
+            class_weights = self.calculate_class_weights(annotations, image_list)
+            self.logger.logger.info(f"Using auto-calculated class weights: {class_weights}")
 
         # Validate class weights before proceeding with training
         if np.any(np.isnan(class_weights)):

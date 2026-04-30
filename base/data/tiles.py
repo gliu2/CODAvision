@@ -20,6 +20,7 @@ import cv2
 from base.image.augmentation import edit_annotation_tiles
 from base.image.utils import load_image_with_fallback
 import gc
+import concurrent.futures
 
 # Set up logging
 import logging
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Constants for loop safeguards
 MAX_ITERATIONS = 10000
 MAX_CONSECUTIVE_FAILURES = 10
+
+# Maximum number of parallel worker processes for big tile creation.
+# Increase this if you have more CPU cores available.
+_TILE_WORKERS = 4
 
 
 def validate_image_list_structure(
@@ -207,7 +212,9 @@ def combine_annotations_into_tiles(
     output_folder: str,
     tile_size: int,
     config: 'TileGenerationConfig',
-    background_class: int = 0
+    background_class: int = 0,
+    start_number: Optional[int] = None,
+    big_tile_index: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Combine annotations into large tiles for training deep neural networks.
@@ -259,8 +266,11 @@ def combine_annotations_into_tiles(
 
     # Check if we've already done this work using configured file format
     file_ext = f".{config.file_format}"
-    existing_images = [f for f in os.listdir(output_path_images) if f.endswith(file_ext)]
-    next_image_number = len(existing_images) + 1
+    if start_number is not None:
+        next_image_number = start_number
+    else:
+        existing_images = [f for f in os.listdir(output_path_images) if f.endswith(file_ext)]
+        next_image_number = len(existing_images) + 1
 
     # Initialize composite canvas
     composite_image = np.full((big_tile_size_with_margin, big_tile_size_with_margin, 3),
@@ -605,7 +615,10 @@ def combine_annotations_into_tiles(
                 continue
 
     # Save the big tile for reference
-    big_tile_number = len([f for f in os.listdir(output_path_big_tiles) if f.startswith('HE')]) + 1
+    if big_tile_index is not None:
+        big_tile_number = big_tile_index
+    else:
+        big_tile_number = len([f for f in os.listdir(output_path_big_tiles) if f.startswith('HE')]) + 1
     logger.info('  Saving big tile')
     # Save big tiles using configured file format
     Image.fromarray(composite_image.astype(np.uint8)).save(
@@ -614,6 +627,23 @@ def combine_annotations_into_tiles(
         os.path.join(output_path_big_tiles, f"label_tile_{big_tile_number}{file_ext}"))
 
     return current_annotations, annotation_percentages
+
+
+def _big_tile_worker(args: tuple):
+    """
+    Top-level worker function for parallel big tile creation.
+    Must be a module-level function to be picklable by ProcessPoolExecutor.
+    """
+    (initial_annotations, current_annotations, annotation_percentages,
+     image_list, num_classes, model_path, output_folder, tile_size, config,
+     start_number, big_tile_index, random_seed) = args
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    return combine_annotations_into_tiles(
+        initial_annotations, current_annotations, annotation_percentages,
+        image_list, num_classes, model_path, output_folder, tile_size, config,
+        start_number=start_number, big_tile_index=big_tile_index,
+    )
 
 
 def create_training_tiles(
@@ -721,26 +751,35 @@ def create_training_tiles(
         shutil.rmtree(os.path.join(model_path, output_type))
 
     big_tiles_path = os.path.join(model_path, output_type, 'big_tiles')
+    output_path_images = os.path.join(model_path, output_type, 'im')
+    file_ext = f".{config.file_format}"
+    _tiles_per_big = (config.big_tile_size // tile_size) ** 2
 
     train_start = time.time()
     if len(glob.glob(os.path.join(big_tiles_path, file_pattern))) >= num_train_tiles:
         logger.info('  Already done.')
     else:
         while len(glob.glob(os.path.join(big_tiles_path, file_pattern))) < num_train_tiles:
-            current_annotations, annotation_percentages = combine_annotations_into_tiles(
-                annotations_array,
-                current_annotations,
-                annotation_percentages,
-                image_list,
-                num_classes,
-                model_path,
-                output_type,
-                tile_size,
-                config
-            )
-
-            logger.debug(f"After combine_annotations_into_tiles - current_annotations shape: {current_annotations.shape}")
-            logger.debug(f"After combine_annotations_into_tiles - unique values in annotation_percentages: {np.unique(annotation_percentages)}")
+            # Run a batch of workers in parallel, each building one big tile
+            _existing_big = len([f for f in os.listdir(big_tiles_path) if f.startswith('HE')]) if os.path.isdir(big_tiles_path) else 0
+            _remaining = num_train_tiles - _existing_big
+            _batch = min(_TILE_WORKERS, max(1, _remaining))
+            os.makedirs(output_path_images, exist_ok=True)
+            _existing_small = len([f for f in os.listdir(output_path_images) if f.endswith(file_ext)])
+            _worker_args = []
+            for _w in range(_batch):
+                _seed = (config.deterministic_seed + _existing_big + _w) if config.deterministic_seed is not None else None
+                _worker_args.append((
+                    annotations_array, current_annotations.copy(), annotation_percentages.copy(),
+                    image_list, num_classes, model_path, output_type, tile_size, config,
+                    _existing_small + _w * _tiles_per_big + 1, _existing_big + _w + 1, _seed,
+                ))
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_batch) as _pool:
+                _results = list(_pool.map(_big_tile_worker, _worker_args))
+            for _ca, _ap in _results:
+                current_annotations = np.minimum(current_annotations, _ca)
+                annotation_percentages[:, :, 0] = np.maximum(annotation_percentages[:, :, 0], _ap[:, :, 0])
+                annotation_percentages[:, :, 1] = np.maximum(annotation_percentages[:, :, 1], _ap[:, :, 1])
 
             elapsed_time = time.time() - train_start
             logger.info(
@@ -770,6 +809,7 @@ def create_training_tiles(
         shutil.rmtree(os.path.join(model_path, output_type))
 
     big_tiles_path = os.path.join(model_path, output_type, 'big_tiles')
+    output_path_images = os.path.join(model_path, output_type, 'im')
     current_annotations = annotations_array.copy()
     annotation_percentages = (annotations_array > 0).astype(float)
     annotation_percentages = np.dstack((annotation_percentages, annotation_percentages))
@@ -782,17 +822,26 @@ def create_training_tiles(
         logger.info('  Already done.')
     else:
         while len(glob.glob(os.path.join(big_tiles_path, file_pattern))) < num_validation_tiles:
-            current_annotations, annotation_percentages = combine_annotations_into_tiles(
-                annotations_array,
-                current_annotations,
-                annotation_percentages,
-                image_list,
-                num_classes,
-                model_path,
-                output_type,
-                tile_size,
-                config
-            )
+            # Run a batch of workers in parallel, each building one big tile
+            _existing_big = len([f for f in os.listdir(big_tiles_path) if f.startswith('HE')]) if os.path.isdir(big_tiles_path) else 0
+            _remaining = num_validation_tiles - _existing_big
+            _batch = min(_TILE_WORKERS, max(1, _remaining))
+            os.makedirs(output_path_images, exist_ok=True)
+            _existing_small = len([f for f in os.listdir(output_path_images) if f.endswith(file_ext)])
+            _worker_args = []
+            for _w in range(_batch):
+                _seed = (config.deterministic_seed + _existing_big + _w) if config.deterministic_seed is not None else None
+                _worker_args.append((
+                    annotations_array, current_annotations.copy(), annotation_percentages.copy(),
+                    image_list, num_classes, model_path, output_type, tile_size, config,
+                    _existing_small + _w * _tiles_per_big + 1, _existing_big + _w + 1, _seed,
+                ))
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_batch) as _pool:
+                _results = list(_pool.map(_big_tile_worker, _worker_args))
+            for _ca, _ap in _results:
+                current_annotations = np.minimum(current_annotations, _ca)
+                annotation_percentages[:, :, 0] = np.maximum(annotation_percentages[:, :, 0], _ap[:, :, 0])
+                annotation_percentages[:, :, 1] = np.maximum(annotation_percentages[:, :, 1], _ap[:, :, 1])
 
             elapsed_time = time.time() - validation_start_time
             logger.info(

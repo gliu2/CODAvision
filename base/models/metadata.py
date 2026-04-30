@@ -244,7 +244,12 @@ class ModelMetadata:
                 "create_down": self.custom_params.get('create_down', False),
                 "downsamp_annotated": self.custom_params.get('downsamp_annotated', False)
             })
-        
+
+        # Persist user-specified class weights when provided
+        user_weights = self.custom_params.get('user_class_weights', None)
+        if user_weights is not None:
+            metadata['user_class_weights'] = list(user_weights)
+
         return metadata
     
     def save(self) -> None:
@@ -301,7 +306,8 @@ def save_model_metadata_gui(
     uncomp_test_pth: str = '',
     scale: str = '',
     create_down: bool = False,
-    downsamp_annotated: bool = False
+    downsamp_annotated: bool = False,
+    user_class_weights: Optional[List[float]] = None
 ) -> None:
     """
     Save model metadata from GUI parameters.
@@ -332,6 +338,9 @@ def save_model_metadata_gui(
         scale: Scaling factor (custom resolution)
         create_down: Whether to create downsampled images
         downsamp_annotated: Whether to downsample annotated images
+        user_class_weights: Optional per-class loss weights in class order.
+            When provided, training uses these weights instead of the
+            auto-calculated median-frequency weights.
     """
     # Create metadata object
     metadata = ModelMetadata(
@@ -355,7 +364,8 @@ def save_model_metadata_gui(
         uncomp_test_pth=uncomp_test_pth,
         scale=scale,
         create_down=create_down,
-        downsamp_annotated=downsamp_annotated
+        downsamp_annotated=downsamp_annotated,
+        user_class_weights=user_class_weights
     )
     
     # Save metadata

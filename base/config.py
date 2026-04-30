@@ -163,12 +163,12 @@ class TileGenerationConfig:
 # Preset tile generation configurations
 MODERN_CONFIG = TileGenerationConfig(
     mode="modern",
-    reduction_factor=10,
+    reduction_factor=15,
     use_disk_filter=False,
     crop_rotations=False,
     class_rotation_frequency=5,
     deterministic_seed=3,
-    big_tile_size=10240,
+    big_tile_size=8192,
     file_format="png"
 )
 

@@ -5,7 +5,7 @@ This module provides utility functions that bridge the GUI components
 with the core CODAvision functionality.
 """
 
-from typing import List, Union, Any
+from typing import List, Optional, Union, Any
 import numpy as np
 import pandas as pd
 
@@ -33,7 +33,8 @@ def save_model_metadata_GUI(
     uncomp_test_pth: str = '',
     scale: str = '',
     create_down: str = '',
-    downsamp_annotated: str = ''
+    downsamp_annotated: str = '',
+    user_class_weights: Optional[List[float]] = None
 ) -> None:
     """
     Save model metadata from GUI parameters.
@@ -70,5 +71,6 @@ def save_model_metadata_GUI(
         uncomp_test_pth=uncomp_test_pth,
         scale=scale,
         create_down=create_down_bool,
-        downsamp_annotated=downsamp_annotated_bool
+        downsamp_annotated=downsamp_annotated_bool,
+        user_class_weights=user_class_weights
     )

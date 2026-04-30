@@ -773,19 +773,35 @@ class SegmentationModelTrainer:
         """
         Create a weighted loss function based on class frequencies.
 
-        This method calculates class weights and creates a loss function
-        that accounts for class imbalance.
+        If the model metadata contains a 'user_class_weights' list (set by the
+        user through the GUI), those weights are used directly instead of the
+        auto-calculated median-frequency weights.
         """
-        # Get file format from model metadata (default to 'tif' for backward compatibility)
-        tile_format = self.model_data.get('tile_format', 'tif')
-        file_pattern = f"*.{tile_format}"
+        user_weights = self.model_data.get('user_class_weights', None)
 
-        # Find all training masks
-        train_path = os.path.join(self.model_path, 'training')
-        train_masks = sorted(glob(os.path.join(train_path, 'label', file_pattern)))
+        if (
+            user_weights is not None
+            and len(user_weights) == self.num_classes
+            and all(w > 0 for w in user_weights)
+        ):
+            self.class_weights = np.array(user_weights, dtype=np.float32)
+            module_logger.info(
+                f"Using user-specified class weights: {self.class_weights}"
+            )
+        else:
+            # Get file format from model metadata (default to 'tif' for backward compatibility)
+            tile_format = self.model_data.get('tile_format', 'tif')
+            file_pattern = f"*.{tile_format}"
 
-        # Calculate class weights
-        self.class_weights = self._calculate_class_weights(train_masks)
+            # Find all training masks
+            train_path = os.path.join(self.model_path, 'training')
+            train_masks = sorted(glob(os.path.join(train_path, 'label', file_pattern)))
+
+            # Calculate class weights (median-frequency balancing)
+            self.class_weights = self._calculate_class_weights(train_masks)
+            module_logger.info(
+                f"Using auto-calculated class weights: {self.class_weights}"
+            )
 
         # Create the loss function
         # Pass num_replicas to compensate for MirroredStrategy summing per-replica losses

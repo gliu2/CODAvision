@@ -41,6 +41,17 @@ else:
     os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
     # logger.info("Python logging level is INFO or higher. OpenCV log level set to ERROR (OpenCV warnings will be suppressed).")
 
+# Suppress TensorFlow C++ startup messages based on logging level.
+# TF_CPP_MIN_LOG_LEVEL: 0=all, 1=suppress INFO, 2=suppress INFO+WARNING, 3=suppress all (incl. ERROR).
+# Level 3 silences the benign cuBLAS double-registration error and TensorRT dlopen warnings.
+# TF_ENABLE_ONEDNN_OPTS=0: disables oneDNN custom ops, eliminating the numerical-difference
+# warning and ensuring fully reproducible floating-point results across runs.
+if effective_python_log_level <= logging.DEBUG:
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '0')
+else:
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 # Ensure OPENCV_IO_MAX_IMAGE_PIXELS is set.
 if 'OPENCV_IO_MAX_IMAGE_PIXELS' not in os.environ:
     os.environ['OPENCV_IO_MAX_IMAGE_PIXELS'] = str(pow(2,40))  # Set max image size for OpenCV to 2^40 pixels

@@ -25,13 +25,17 @@ def _load_image_pil_internal(image_path, image_size: int, mask: bool) -> np.ndar
     Internal helper function to load images using PIL (for TIFF support).
     This function is designed to be called via tf.py_function.
 
+    Resize is intentionally NOT performed here; it is delegated to tf.image.resize
+    in the dataset pipeline so that the operation runs on GPU.
+
     Args:
         image_path: File path (can be string, bytes, or numpy array of bytes)
-        image_size: Size to which the image should be resized
+        image_size: Unused – kept for backward-compatible call signatures. Resize
+            happens outside this function via tf.image.resize.
         mask: Whether the image is a segmentation mask (single channel) or not (RGB)
 
     Returns:
-        Numpy array of the loaded and preprocessed image
+        Numpy array of the loaded image (variable H×W, not yet resized)
     """
     # Convert to string path - handle various input types from tf.py_function
     if isinstance(image_path, bytes):
@@ -63,46 +67,63 @@ def _load_image_pil_internal(image_path, image_size: int, mask: bool) -> np.ndar
                 if match:
                     path_str = match.group(1)
 
-    # Load image with PIL
+    # Load image with PIL (no resize – delegated to GPU via tf.image.resize)
     pil_image = Image.open(path_str)
     image_array = np.array(pil_image)
 
     if mask:
         # Ensure single channel for masks
         if len(image_array.shape) == 3:
-            # Multi-channel image, take first channel
             image_array = image_array[:, :, 0]
-        # Add channel dimension
         if len(image_array.shape) == 2:
             image_array = np.expand_dims(image_array, -1)
-        # Resize
-        if image_array.shape[0] != image_size or image_array.shape[1] != image_size:
-            image_pil = Image.fromarray(image_array.squeeze())
-            image_pil = image_pil.resize((image_size, image_size), Image.NEAREST)
-            image_array = np.array(image_pil)
-            if len(image_array.shape) == 2:
-                image_array = np.expand_dims(image_array, -1)
         return image_array.astype(np.float32)
     else:
         # Ensure 3 channels for RGB images
         if len(image_array.shape) == 2:
-            # Grayscale, convert to RGB
             image_array = np.stack([image_array] * 3, axis=-1)
         elif len(image_array.shape) == 3 and image_array.shape[-1] == 1:
-            # Single channel, convert to RGB
             image_array = np.repeat(image_array, 3, axis=-1)
         elif len(image_array.shape) == 3 and image_array.shape[-1] > 3:
-            # More than 3 channels, take first 3
             image_array = image_array[:, :, :3]
-        # Resize
-        if image_array.shape[0] != image_size or image_array.shape[1] != image_size:
-            image_pil = Image.fromarray(image_array.astype(np.uint8))
-            image_pil = image_pil.resize((image_size, image_size), Image.BILINEAR)
-            image_array = np.array(image_pil)
         return image_array.astype(np.float32)
 
 # Don't let AutoGraph convert this function
 _load_image_pil_internal = tf.autograph.experimental.do_not_convert(_load_image_pil_internal)
+
+
+def _is_native_tf_format(path_str: str) -> bool:
+    """Return True for formats that TF can decode natively (PNG, JPEG, BMP, GIF)."""
+    return path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+
+
+def _load_image_tf_native(image_path_tensor, image_size: int, mask: bool) -> tf.Tensor:
+    """
+    Load and resize an image using TF-native ops only (no Python/PIL overhead).
+    Works for PNG and JPEG tiles.  GPU-accelerated decode+resize.
+
+    Args:
+        image_path_tensor: String tensor with the file path
+        image_size: Target square size
+        mask: True for label masks (nearest-neighbour resize), False for RGB images
+
+    Returns:
+        Float32 tensor of shape [image_size, image_size, C]
+    """
+    raw = tf.io.read_file(image_path_tensor)
+    if mask:
+        img = tf.io.decode_image(raw, channels=1, expand_animations=False)
+        img.set_shape([None, None, 1])
+        img = tf.cast(img, tf.float32)
+        img = tf.image.resize(img, [image_size, image_size], method='nearest')
+        img.set_shape([image_size, image_size, 1])
+    else:
+        img = tf.io.decode_image(raw, channels=3, expand_animations=False)
+        img.set_shape([None, None, 3])
+        img = tf.cast(img, tf.float32)
+        img = tf.image.resize(img, [image_size, image_size], method='bilinear')
+        img.set_shape([image_size, image_size, 3])
+    return img
 
 
 def read_image(
@@ -212,7 +233,14 @@ def create_dataset(
     Returns:
         TensorFlow dataset containing batches of (image, mask) pairs
     """
-    # Define wrapper functions outside of load_data to avoid AutoGraph issues
+    # Detect tile format from the first path (if available) so we can choose
+    # the fastest loading path for each element.  PNG/JPEG tiles can be
+    # decoded and resized entirely on the GPU via TF-native ops, which is
+    # significantly faster than going through Python/PIL for every tile.
+    _first_path = image_paths[0] if image_paths else ''
+    _use_tf_native = _is_native_tf_format(_first_path)
+
+    # PIL wrapper – loads raw array WITHOUT resize (resize happens on GPU below)
     def load_image_wrapper(path):
         return _load_image_pil_internal(path, image_size, False)
 
@@ -220,21 +248,23 @@ def create_dataset(
         return _load_image_pil_internal(path, image_size, True)
 
     def load_data(image_path, mask_path):
-        """Inner function to load an image and its corresponding mask using tf.py_function."""
-        # Use tf.py_function to load TIFF files with PIL
-        image = tf.py_function(
-            func=load_image_wrapper,
-            inp=[image_path],
-            Tout=tf.float32
-        )
-        mask = tf.py_function(
-            func=load_mask_wrapper,
-            inp=[mask_path],
-            Tout=tf.float32
-        )
-        # Set shapes explicitly (required after tf.py_function)
-        image.set_shape([image_size, image_size, 3])
-        mask.set_shape([image_size, image_size, 1])
+        """Load image+mask, with GPU-accelerated resize applied outside py_function."""
+        if _use_tf_native:
+            # Pure TF path: decode + resize on GPU, no Python overhead
+            image = _load_image_tf_native(image_path, image_size, mask=False)
+            mask = _load_image_tf_native(mask_path, image_size, mask=True)
+        else:
+            # TIFF / other formats: PIL load (CPU), then TF resize (GPU)
+            image = tf.py_function(func=load_image_wrapper, inp=[image_path], Tout=tf.float32)
+            mask = tf.py_function(func=load_mask_wrapper, inp=[mask_path], Tout=tf.float32)
+            # Dynamic shapes after py_function
+            image.set_shape([None, None, 3])
+            mask.set_shape([None, None, 1])
+            # GPU-accelerated resize (tf.image.resize dispatches to GPU when available)
+            image = tf.image.resize(image, [image_size, image_size], method='bilinear')
+            mask = tf.image.resize(mask, [image_size, image_size], method='nearest')
+            image.set_shape([image_size, image_size, 3])
+            mask.set_shape([image_size, image_size, 1])
         return image, mask
 
     # Create a dataset from the file paths
@@ -302,7 +332,11 @@ def create_training_dataset(
     if data_config is None:
         data_config = DataConfig()
 
-    # Define wrapper functions outside of load_data to avoid AutoGraph issues
+    # Choose fastest loading strategy based on tile format
+    _first_path = image_paths[0] if image_paths else ''
+    _use_tf_native = _is_native_tf_format(_first_path)
+
+    # PIL wrapper – raw load without resize (resize happens on GPU below)
     def load_image_wrapper(path):
         return _load_image_pil_internal(path, image_size, False)
 
@@ -310,21 +344,19 @@ def create_training_dataset(
         return _load_image_pil_internal(path, image_size, True)
 
     def load_data(image_path, mask_path):
-        """Inner function to load an image and its corresponding mask using tf.py_function."""
-        # Use tf.py_function to load TIFF files with PIL
-        image = tf.py_function(
-            func=load_image_wrapper,
-            inp=[image_path],
-            Tout=tf.float32
-        )
-        mask = tf.py_function(
-            func=load_mask_wrapper,
-            inp=[mask_path],
-            Tout=tf.float32
-        )
-        # Set shapes explicitly (required after tf.py_function)
-        image.set_shape([image_size, image_size, 3])
-        mask.set_shape([image_size, image_size, 1])
+        """Load image+mask with GPU-accelerated resize outside py_function."""
+        if _use_tf_native:
+            image = _load_image_tf_native(image_path, image_size, mask=False)
+            mask = _load_image_tf_native(mask_path, image_size, mask=True)
+        else:
+            image = tf.py_function(func=load_image_wrapper, inp=[image_path], Tout=tf.float32)
+            mask = tf.py_function(func=load_mask_wrapper, inp=[mask_path], Tout=tf.float32)
+            image.set_shape([None, None, 3])
+            mask.set_shape([None, None, 1])
+            image = tf.image.resize(image, [image_size, image_size], method='bilinear')
+            mask = tf.image.resize(mask, [image_size, image_size], method='nearest')
+            image.set_shape([image_size, image_size, 3])
+            mask.set_shape([image_size, image_size, 1])
         return image, mask
 
     # Create a dataset from the file paths
@@ -392,7 +424,10 @@ def create_validation_dataset(
     if data_config is None:
         data_config = DataConfig()
 
-    # Define wrapper functions outside of load_data to avoid AutoGraph issues
+    # Choose fastest loading strategy based on tile format
+    _first_path = image_paths[0] if image_paths else ''
+    _use_tf_native = _is_native_tf_format(_first_path)
+
     def load_image_wrapper(path):
         return _load_image_pil_internal(path, image_size, False)
 
@@ -400,21 +435,19 @@ def create_validation_dataset(
         return _load_image_pil_internal(path, image_size, True)
 
     def load_data(image_path, mask_path):
-        """Inner function to load an image and its corresponding mask using tf.py_function."""
-        # Use tf.py_function to load TIFF files with PIL
-        image = tf.py_function(
-            func=load_image_wrapper,
-            inp=[image_path],
-            Tout=tf.float32
-        )
-        mask = tf.py_function(
-            func=load_mask_wrapper,
-            inp=[mask_path],
-            Tout=tf.float32
-        )
-        # Set shapes explicitly (required after tf.py_function)
-        image.set_shape([image_size, image_size, 3])
-        mask.set_shape([image_size, image_size, 1])
+        """Load image+mask with GPU-accelerated resize outside py_function."""
+        if _use_tf_native:
+            image = _load_image_tf_native(image_path, image_size, mask=False)
+            mask = _load_image_tf_native(mask_path, image_size, mask=True)
+        else:
+            image = tf.py_function(func=load_image_wrapper, inp=[image_path], Tout=tf.float32)
+            mask = tf.py_function(func=load_mask_wrapper, inp=[mask_path], Tout=tf.float32)
+            image.set_shape([None, None, 3])
+            mask.set_shape([None, None, 1])
+            image = tf.image.resize(image, [image_size, image_size], method='bilinear')
+            mask = tf.image.resize(mask, [image_size, image_size], method='nearest')
+            image.set_shape([image_size, image_size, 3])
+            mask.set_shape([image_size, image_size, 1])
         return image, mask
 
     # Create a dataset from the file paths

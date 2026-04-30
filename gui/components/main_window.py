@@ -84,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.delete_PB.clicked.connect(self.delete_annotation_class)
         self.ui.nesting_checkBox.stateChanged.connect(self.on_nesting_checkbox_state_changed)
         self.ui.classify_PB.clicked.connect(self.open_classify)
+        self.ui.export_settings_PB.clicked.connect(self.export_settings)
         self.ui.prerecorded_PB.clicked.connect(self.browse_prerecorded_file)
         self.ui.trianing_LE.textChanged.connect(self.check_for_trained_model)
         self.ui.custom_img_LE.textChanged.connect(self.check_for_trained_model)
@@ -293,8 +294,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ntrain = data['ntrain']
                 self.nval = data['nvalidate']
                 self.TA = data['nTA']
+                self.saved_user_class_weights = data.get('user_class_weights', None)
                 self.load_saved_values()
                 logger.info("Prerecorded data loaded successfully.")
+                self.ui.export_settings_PB.setEnabled(True)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to load prerecorded data: {str(e)}')
 
@@ -1127,9 +1130,12 @@ class MainWindow(QtWidgets.QMainWindow):
         layer_names = [self.combined_df['Layer Name'][layer] for layer in self.combined_df.index
                        if self.combined_df['Deleted'][layer] == False]
 
-        # Configure component_TW
-        self.ui.component_TW.setColumnCount(1)
-        self.ui.component_TW.setHorizontalHeaderLabels(["Annotation layers"])
+        # Retrieve previously saved per-class weights (from prerecorded data, or from last save)
+        saved_weights = getattr(self, 'saved_user_class_weights', None)
+
+        # Configure component_TW: col 0 = annotation layer checkbox, col 1 = class weight
+        self.ui.component_TW.setColumnCount(2)
+        self.ui.component_TW.setHorizontalHeaderLabels(["Annotation layers", "Class Weight"])
         self.ui.component_TW.horizontalHeader().setSectionResizeMode(
             QHeaderView.Stretch)  # Data matches the table width
 
@@ -1162,10 +1168,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.ui.component_TW.setItem(row, 0, item)
 
+            # Class weight column: editable, default 1.0, restored from saved weights if available
+            if saved_weights is not None and row < len(saved_weights):
+                weight_text = str(saved_weights[row])
+            else:
+                weight_text = '1.0'
+            weight_item = QtWidgets.QTableWidgetItem(weight_text)
+            weight_item.setTextAlignment(Qt.AlignCenter)
+            self.ui.component_TW.setItem(row, 1, weight_item)
+
         # Connect itemChanged signal to slot (value gets gray after being checked)
         self.ui.component_TW.itemChanged.connect(self.on_item_changed)
 
     def on_item_changed(self, item):
+        # Only apply checkbox styling to column 0; ignore edits to the class weight column
+        if item.column() != 0:
+            return
         if item.checkState() == Qt.Checked:
             item.setBackground(QColor(200, 200, 200))  # Light gray
             item.setForeground(QBrush(Qt.black))  # Black text
@@ -1377,6 +1395,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self.TA = self.ui.TA_SB.value()
         self.train = train
 
+        # Read per-class weights from the Class Weight column of component_TW
+        class_weights = []
+        weights_valid = True
+        for row in range(self.ui.component_TW.rowCount()):
+            weight_item = self.ui.component_TW.item(row, 1)
+            weight_text = weight_item.text().strip() if weight_item else '1.0'
+            try:
+                w = float(weight_text)
+                if w <= 0:
+                    raise ValueError
+                class_weights.append(w)
+            except ValueError:
+                weights_valid = False
+                break
+
+        if not weights_valid:
+            QtWidgets.QMessageBox.warning(
+                self, 'Invalid Class Weights',
+                'Class weights must be positive numbers. Please correct the values in the Class Weight column.'
+            )
+            return
+
+        # Store as None if all weights are 1.0 (no user customisation)
+        if all(w == 1.0 for w in class_weights):
+            self.user_class_weights = None
+        else:
+            self.user_class_weights = class_weights
+        # Also update saved_user_class_weights so re-opening the dialog restores them
+        self.saved_user_class_weights = self.user_class_weights
+
         # Save model metadata onto pickle file
         self.variable_parametrization_to_WS()
         self.close()
@@ -1467,11 +1515,51 @@ class MainWindow(QtWidgets.QMainWindow):
                                     uncomp_train_pth=self.uncomp_train_pth,
                                     uncomp_test_pth=self.uncomp_test_pth, scale=self.scale,
                                     create_down=self.create_down,
-                                    downsamp_annotated=self.downsamp_annotated_images)
+                                    downsamp_annotated=self.downsamp_annotated_images,
+                                    user_class_weights=getattr(self, 'user_class_weights', None))
         else:
             save_model_metadata_GUI(pthDL, pthim, pthtest, WS, model_name, umpix, colormap,
                                     tile_size, classNames, ntrain, nvalidate, nTA, final_df,
-                                    combined_df, model_type, batch_size)
+                                    combined_df, model_type, batch_size,
+                                    user_class_weights=getattr(self, 'user_class_weights', None))
+
+        # Auto-save a copy of settings to the training folder root for easy reloading.
+        # This file has the same format as net.pkl and can be loaded via "Load Settings".
+        self._settings_saved_path = os.path.join(pthDL, 'net.pkl')
+        _settings_backup = os.path.join(pth, 'codavision_settings.pkl')
+        try:
+            shutil.copy2(self._settings_saved_path, _settings_backup)
+            logger.info(f'Settings backed up to: {_settings_backup}')
+        except Exception as _e:
+            logger.warning(f'Could not auto-save settings backup: {_e}')
+        self.ui.export_settings_PB.setEnabled(True)
+
+    def export_settings(self):
+        """Export the current settings to a user-specified file for reuse in a future session."""
+        src_path = getattr(self, '_settings_saved_path', None)
+        if src_path is None or not os.path.isfile(src_path):
+            QtWidgets.QMessageBox.warning(
+                self, 'No Settings to Export',
+                'Complete the setup through all tabs first (Segmentation Settings, Nesting, '
+                'Advanced Settings), then use Export Settings.\n\n'
+                'Tip: a backup is also auto-saved to your training folder as '
+                '"codavision_settings.pkl" each time you save.'
+            )
+            return
+        dest_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export Settings', os.path.dirname(src_path), 'Settings Files (*.pkl)'
+        )
+        if not dest_path:
+            return
+        try:
+            shutil.copy2(src_path, dest_path)
+            QtWidgets.QMessageBox.information(
+                self, 'Settings Exported',
+                f'Settings saved to:\n{dest_path}\n\n'
+                'Load them next time by clicking "Load Settings".'
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Export Failed', f'Could not save settings:\n{e}')
 
     def load_saved_values(self):
         if self.prerecorded_data:
