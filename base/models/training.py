@@ -973,6 +973,20 @@ class SegmentationModelTrainer:
         # Create loss function
         self._create_loss_function()
 
+        # Enable mixed precision (float16 compute, float32 weights) to halve
+        # activation memory.  This is safe because:
+        #   - The final Conv2D output is explicitly cast to float32 in the model
+        #   - The custom loss operates in float32 internally
+        #   - LossScaleOptimizer (applied in _compile_model) prevents gradient underflow
+        if tf.config.list_physical_devices('GPU'):
+            current_policy = tf.keras.mixed_precision.global_policy().name
+            if current_policy != 'mixed_float16':
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                module_logger.info(
+                    "Mixed precision enabled (float16 activations, float32 weights). "
+                    "Activation memory approximately halved."
+                )
+
         # Create model and compile within strategy scope for multi-GPU
         if self.strategy and self.num_gpus > 1:
             with self.strategy.scope():
@@ -1110,6 +1124,12 @@ class DeepLabV3PlusTrainer(SegmentationModelTrainer):
                 epsilon=self.optimizer_epsilon,
                 global_clipnorm=1.0,
             )
+
+        # Wrap with LossScaleOptimizer when running mixed precision so that
+        # float16 gradients are scaled up before the update step (preventing
+        # underflow to 0) then scaled back down before weight application.
+        if tf.keras.mixed_precision.global_policy().name == 'mixed_float16':
+            optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
         model.compile(
             optimizer=optimizer,

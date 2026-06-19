@@ -481,58 +481,52 @@ def combine_annotations_into_tiles(
             x = int(max_dist_points[0][index[0]] * reduction_factor)
             y = int(max_dist_points[1][index[0]] * reduction_factor)
 
-        # Calculate placement position ensuring we stay in bounds
+        # Compute the annotation half-sizes for centred placement
         annotation_size = np.array(annotation_mask.shape) - 1
         half_size_a = annotation_size // 2
         half_size_b = annotation_size - half_size_a
-
-        # Convert numpy arrays to tuples for slicing
         half_size_a = tuple(map(int, half_size_a))
         half_size_b = tuple(map(int, half_size_b))
 
-        # Adjust position if needed to stay in bounds
-        if x + half_size_a[0] + 1 > composite_mask.shape[0]:
-            x -= half_size_a[0]
-        if y + half_size_a[1] + 1 > composite_mask.shape[1]:
-            y -= half_size_a[1]
-        if x - half_size_b[0] < 0:
-            x += half_size_b[0]
-        if y - half_size_b[1] < 0:
-            y += half_size_b[1]
+        # Compute unclipped placement coordinates
+        rs = x - half_size_b[0]
+        re = x + half_size_a[0] + 1
+        cs = y - half_size_b[1]
+        ce = y + half_size_a[1] + 1
 
-        # # Create slices for the region where we'll place this tile
-        # region_slice_x = slice(x - half_size_b[0], x + half_size_a[0] + 1)
-        # region_slice_y = slice(y - half_size_b[1], y + half_size_a[1] + 1)
-        #
-        # # Place the tile in the composite
-        # temp_mask = composite_mask[region_slice_x, region_slice_y].copy()
-        # temp_mask[valid_pixels] = annotation_mask[valid_pixels]
-        # composite_mask[region_slice_x, region_slice_y] = temp_mask
-        #
-        # temp_image = composite_image[region_slice_x, region_slice_y, :].copy()
-        # valid_pixels_3d = np.dstack((valid_pixels, valid_pixels, valid_pixels))
-        # temp_image[valid_pixels_3d] = image[valid_pixels_3d]
-        # composite_image[region_slice_x, region_slice_y, :] = temp_image
+        # Annotation offsets: how far into the annotation tile to start if
+        # the tile extends before the composite edge (rs<0 or cs<0).
+        ann_rs = max(0, -rs)
+        ann_cs = max(0, -cs)
+        # Clip composite coordinates to valid range
+        rs = max(0, rs)
+        cs = max(0, cs)
+        re = min(composite_mask.shape[0], re)
+        ce = min(composite_mask.shape[1], ce)
+        ann_re = ann_rs + (re - rs)
+        ann_ce = ann_cs + (ce - cs)
 
-        # Use direct slicing instead of slice objects
-        # Copy the current mask values in the target region
-        temp_mask = composite_mask[x - half_size_b[0]:x + half_size_a[0] + 1,
-                                   y - half_size_b[1]:y + half_size_a[1] + 1].copy()
-        # Apply the new annotation mask to valid pixels
-        temp_mask[valid_pixels] = annotation_mask[valid_pixels]
-        # Update the composite mask
-        composite_mask[x - half_size_b[0]:x + half_size_a[0] + 1,
-                       y - half_size_b[1]:y + half_size_a[1] + 1] = temp_mask
+        # Skip entirely if clipped to nothing (annotation larger than canvas)
+        if re <= rs or ce <= cs:
+            count += 1
+            iteration += 1
+            continue
 
-        # Do the same for the image
-        temp_image = composite_image[x - half_size_b[0]:x + half_size_a[0] + 1,
-                                     y - half_size_b[1]:y + half_size_a[1] + 1, :].copy()
-        # Apply the new image to valid pixels
-        valid_pixels_3d = np.dstack((valid_pixels, valid_pixels, valid_pixels))
-        temp_image[valid_pixels_3d] = image[valid_pixels_3d]
-        # Update the composite image
-        composite_image[x - half_size_b[0]:x + half_size_a[0] + 1,
-                        y - half_size_b[1]:y + half_size_a[1] + 1, :] = temp_image
+        # Slice annotation arrays to exactly the placed region so shapes always match
+        ann_mask_placed = annotation_mask[ann_rs:ann_re, ann_cs:ann_ce]
+        valid_px = valid_pixels[ann_rs:ann_re, ann_cs:ann_ce]
+        image_placed = image[ann_rs:ann_re, ann_cs:ann_ce, :]
+
+        # Place mask
+        temp_mask = composite_mask[rs:re, cs:ce].copy()
+        temp_mask[valid_px] = ann_mask_placed[valid_px]
+        composite_mask[rs:re, cs:ce] = temp_mask
+
+        # Place image
+        temp_image = composite_image[rs:re, cs:ce, :].copy()
+        valid_pixels_3d = np.dstack((valid_px, valid_px, valid_px))
+        temp_image[valid_pixels_3d] = image_placed[valid_pixels_3d]
+        composite_image[rs:re, cs:ce, :] = temp_image
 
         # Update fill ratio periodically
         if count % 2 == 0:

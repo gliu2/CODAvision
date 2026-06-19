@@ -22,6 +22,7 @@ Example usage:
 
 import os
 os.environ['OPENCV_IO_MAX_IMAGE_PIXELS'] = str(pow(2,40))
+import gc
 import time
 import numpy as np
 import cv2
@@ -328,9 +329,10 @@ class ImageClassifier:
                 # Add to the result image
                 classified_image[row + 100:row + self.image_size - 100, col + 100:col + self.image_size - 100] = tile_classified
 
-        # Crop back to original size
-        original_image = padded_image[padding:-padding, padding:-padding, :]
-        classified_image = classified_image[padding:-padding, padding:-padding]
+        # Crop back to original size (copy slices so the large padded arrays can be freed)
+        original_image = padded_image[padding:-padding, padding:-padding, :].copy()
+        classified_image = classified_image[padding:-padding, padding:-padding].copy()
+        del padded_image, padded_mask
 
         # Post-process the classification
         classified_image = classified_image + 1
@@ -507,6 +509,12 @@ class ImageClassifier:
 
             elapsed_time = round(time.time() - classification_start)
             logger.info(f'Image {i + 1} of {len(image_list)} took {elapsed_time} s')
+
+            # Explicitly release large arrays so RAM is reclaimed before the
+            # next image is loaded (Linux OOM killer otherwise kills the process
+            # mid-batch when 100+ large WSI images are processed sequentially).
+            del original_image, classified_image, classified_image_pil
+            gc.collect()
 
         # Display results if requested
         if display and first_image is not None and first_img_prediction is not None:

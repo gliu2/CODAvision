@@ -229,8 +229,13 @@ class DeepLabV3Plus(BaseSegmentationModel):
             interpolation="bilinear",
         )(x)
 
-        # Output segmentation map (no regularization on final layer)
-        outputs = layers.Conv2D(self.num_classes, kernel_size=(1, 1), padding="same")(x)
+        # Output segmentation map (no regularization on final layer).
+        # dtype='float32' ensures logits are float32 even when the global
+        # mixed_precision policy is 'mixed_float16', which is required for
+        # numerical stability of the loss function.
+        outputs = layers.Conv2D(
+            self.num_classes, kernel_size=(1, 1), padding="same", dtype='float32'
+        )(x)
 
         # Create and return model
         model = Model(model_input, outputs, name='DeepLabV3_plus')
